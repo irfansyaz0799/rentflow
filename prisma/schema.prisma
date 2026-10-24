@@ -1,0 +1,273 @@
+// ─── DATABASE & GENERATOR ────────────────────────────────────────────────────
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider  = "postgresql"
+  url       = env("DATABASE_URL")
+  directUrl = env("DIRECT_URL")
+}
+
+// ─── ENUMS (STATUSES & CATEGORIES) ───────────────────────────────────────────
+
+enum Role {
+  OWNER
+  TENANT
+}
+
+enum RoomStatus {
+  VACANT
+  OCCUPIED
+}
+
+enum InvitationStatus {
+  PENDING
+  ACCEPTED
+  EXPIRED
+}
+
+enum InvoiceStatus {
+  DRAFT
+  SENT
+  PENDING_REVIEW // Payment proof uploaded, waiting for owner audit
+  REJECTED       // Proof rejected, waiting for tenant to re-upload
+  PAID           // Audit passed, receipt generated
+}
+
+enum IssueCategory {
+  ELECTRIC
+  WATER
+  WIFI
+  OTHER
+}
+
+enum IssueStatus {
+  OPEN                  // Newly created by tenant
+  IN_PROGRESS           // Owner is fixing the issue
+  PENDING_CONFIRMATION  // Owner marked as done, waiting for tenant confirmation
+  RESOLVED              // Tenant confirmed the issue is fixed
+  REJECTED              // Owner rejected (out of scope)
+  REOPENED              // Tenant is unsatisfied and reopened the issue
+}
+
+// ─── USER ENTITIES (OWNER & TENANT) ──────────────────────────────────────────
+
+model User {
+  id        String   @id @default(cuid())
+  email     String   @unique
+  password  String   // Hashed via bcrypt
+  name      String
+  phone     String?
+  role      Role     @default(TENANT)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // Relations
+  properties Property[] // If role is OWNER
+  tenant     Tenant?    // If role is TENANT (Rental Profile)
+}
+
+// ─── PROPERTY ENTITIES (PROPERTY & ROOM) ─────────────────────────────────────
+
+model Property {
+  id        String   @id @default(cuid())
+  refCode   String   @unique // e.g., "PLZ", "RMA"
+  name      String
+  address   String
+  ownerId   String
+  owner     User     @relation(fields: [ownerId], references: [id])
+  createdAt DateTime @default(now())
+
+  // Relations
+  rooms        Room[]
+  utilityBills UtilityBill[]
+  invitations  Invitation[]
+}
+
+model Room {
+  id          String     @id @default(cuid())
+  refCode     String     @unique // e.g., "PLZ-01", "PLZ-02"
+  propertyId  String
+  property    Property   @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  monthlyRent Decimal    @db.Decimal(10, 2) // e.g., 700.00
+  status      RoomStatus @default(VACANT)
+
+  // Relations
+  tenants     Tenant[]
+  invoices    Invoice[]
+  issues      IssueReport[]
+  invitations Invitation[]
+}
+
+// ─── TENANT ENTITY ───────────────────────────────────────────────────────────
+
+model Tenant {
+  id          String   @id @default(cuid())
+  userId      String   @unique
+  user        User     @relation(fields: [userId], references: [id], onDelete: Cascade)
+  roomId      String
+  room        Room     @relation(fields: [roomId], references: [id])
+  moveInDate  DateTime @default(now())
+  moveOutDate DateTime?
+  isActive    Boolean  @default(true)
+
+  // Relations
+  invoices Invoice[]
+  issues   IssueReport[]
+}
+
+// ─── INVITATION ENTITY (SHARE LINK) ──────────────────────────────────────────
+
+model Invitation {
+  id         String           @id @default(cuid())
+  token      String           @unique // Random UUID for invitation URL
+  propertyId String
+  property   Property         @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  roomId     String
+  room       Room             @relation(fields: [roomId], references: [id], onDelete: Cascade)
+  
+  tenantName String           // Temporary name before registration
+  phone      String
+  status     InvitationStatus @default(PENDING)
+  expiresAt  DateTime
+  createdAt  DateTime         @default(now())
+}
+
+// ─── UTILITIES & INVOICE ENTITIES ────────────────────────────────────────────
+
+model UtilityBill {
+  id              String   @id @default(cuid())
+  propertyId      String
+  property        Property @relation(fields: [propertyId], references: [id], onDelete: Cascade)
+  month           Int      // 1 - 12
+  year            Int      // e.g., 2026
+  electricity     Decimal  @db.Decimal(10, 2)
+  water           Decimal  @db.Decimal(10, 2)
+  wifi            Decimal  @db.Decimal(10, 2)
+  utilitiesTotal  Decimal  @db.Decimal(10, 2)
+  tenantCount     Int      // Snapshot of active tenants during bill generation
+  utilityShare    Decimal  @db.Decimal(10, 2) // utilitiesTotal / tenantCount
+  createdAt       DateTime @default(now())
+
+  // Relations
+  invoices Invoice[]
+
+  @@unique([propertyId, month, year]) // Prevent duplicate utility bills for the same property and month
+}
+
+model Invoice {
+  id            String        @id @default(cuid())
+  invoiceNo     String        @unique // e.g., "INV-2610-001"
+  tenantId      String
+  tenant        Tenant        @relation(fields: [tenantId], references: [id])
+  roomId        String
+  room          Room          @relation(fields: [roomId], references: [id])
+  utilityBillId String
+  utilityBill   UtilityBill   @relation(fields: [utilityBillId], references: [id])
+  status        InvoiceStatus @default(DRAFT)
+
+  // SNAPSHOT DATA (Crucial: Data remains static even if rent/utilities change in the future)
+  rentSnapshot            Decimal @db.Decimal(10, 2)
+  electricitySnapshot     Decimal @db.Decimal(10, 2)
+  waterSnapshot           Decimal @db.Decimal(10, 2)
+  wifiSnapshot            Decimal @db.Decimal(10, 2)
+  utilitiesTotalSnapshot  Decimal @db.Decimal(10, 2)
+  utilityShareSnapshot    Decimal @db.Decimal(10, 2)
+  totalPayable            Decimal @db.Decimal(10, 2)
+
+  dueDate       DateTime
+  createdAt     DateTime      @default(now())
+  updatedAt     DateTime      @updatedAt
+
+  // Relations
+  payment Payment?
+}
+
+// ─── PAYMENT & RECEIPT ENTITIES ──────────────────────────────────────────────
+
+model Payment {
+  id            String        @id @default(cuid())
+  invoiceId     String        @unique
+  invoice       Invoice       @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  
+  amountClaimed Decimal       @db.Decimal(10, 2)
+  paymentDate   DateTime
+  referenceNo   String?
+  tenantNote    String?
+  
+  proofFileUrl  String        // File URL from Supabase Storage
+  proofFileType String        // "IMAGE" or "PDF"
+  
+  status        String        @default("PENDING") // PENDING, APPROVED, REJECTED
+  rejectionReason String?
+  reviewedAt    DateTime?
+  
+  createdAt     DateTime      @default(now())
+
+  // Relations
+  receipt Receipt?
+}
+
+model Receipt {
+  id            String   @id @default(cuid())
+  receiptNo     String   @unique // e.g., "RES-2610-001"
+  paymentId     String   @unique
+  payment       Payment  @relation(fields: [paymentId], references: [id], onDelete: Cascade)
+  
+  pdfUrl        String   // Generated PDF URL
+  generatedAt   DateTime @default(now())
+}
+
+// ─── ISSUE REPORT ENTITIES (TWO-TIER WORKFLOW) ───────────────────────────────
+
+model IssueReport {
+  id          String        @id @default(cuid())
+  ticketNo    String        @unique // e.g., "ADU-2610-001"
+  
+  tenantId    String
+  tenant      Tenant        @relation(fields: [tenantId], references: [id])
+  roomId      String
+  room        Room          @relation(fields: [roomId], references: [id])
+  
+  category    IssueCategory
+  title       String
+  description String
+  photos      String[]      // Array of image URLs
+  
+  status      IssueStatus   @default(OPEN)
+  ownerNote   String?       // Owner's note/remarks
+  reopenNote  String?       // Reason for tenant reopening the issue
+  reopenCount Int           @default(0)
+
+  createdAt   DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  // Relations
+  timeline IssueTimeline[]
+}
+
+model IssueTimeline {
+  id         String      @id @default(cuid())
+  issueId    String
+  issue      IssueReport @relation(fields: [issueId], references: [id], onDelete: Cascade)
+  actorName  String      // Owner or Tenant name
+  actorRole  Role
+  action     String      // e.g., "Open Issue", "Take Action", "Mark as Done"
+  note       String?     // Additional remarks
+  createdAt  DateTime    @default(now())
+}
+
+// ─── GLOBAL AUDIT LOG ENTITY ─────────────────────────────────────────────────
+
+model AuditLog {
+  id         String   @id @default(cuid())
+  userId     String   // Who performed the action (Owner or Tenant)
+  action     String   // e.g., "CREATE_INVOICE", "APPROVE_PAYMENT", "REJECT_ISSUE"
+  entity     String   // e.g., "Invoice", "Payment", "IssueReport"
+  entityId   String   // ID of the affected entity
+  details    String?  // JSON string for extra details
+  ipAddress  String?
+  createdAt  DateTime @default(now())
+}
